@@ -1,0 +1,6 @@
+node_modules/
+dist/
+release/
+*.log
+# 内部开发笔记，不随仓库分发
+CLAUDE.md
