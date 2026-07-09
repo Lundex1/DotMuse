@@ -11,7 +11,7 @@ const itemH = (it) => (it.w || DEFAULT_W) / aspectOf(it);
 const origUrl = (it) => `reflib://orig/${it.file_path.replace(/\\/g, '/')}`;
 const keyOf = (kind, id) => `${kind}:${id}`;
 
-export default function BoardCanvas({ boardId, boardName, assets, onOpenAsset, showToast, onAskAI }) {
+export default function BoardCanvas({ boardId, boardName, assets, onOpenAsset, showToast, onAskAI, onSendToAi }) {
   const wrapRef = useRef(null);
   const [items, setItems] = useState([]);
   const [widgets, setWidgets] = useState([]);
@@ -90,6 +90,8 @@ export default function BoardCanvas({ boardId, boardName, assets, onOpenAsset, s
     // 换图板必须清空：剪贴的项 id 和撤销栈都只对原图板有效
     clipRef.current = [];
     undoRef.current = [];
+    // 视口适配标记也要复位：原位切换图板时按新图板内容重新适应视图
+    fitted.current = false;
   }, [boardId]);
 
   const persistItem = useCallback((it) => {
@@ -509,11 +511,10 @@ export default function BoardCanvas({ boardId, boardName, assets, onOpenAsset, s
   };
   const pasteCopies = async () => {
     if (!clipRef.current.length) return false;
-    const created = [];
-    for (const id of clipRef.current) {
-      const row = await window.refhub.duplicateBoardItem(id, 28, 28);
-      if (row) created.push(row);
-    }
+    // 并发发起（主进程仍按序处理，z 顺序不乱），几十张时明显更快
+    const created = (await Promise.all(
+      clipRef.current.map((id) => window.refhub.duplicateBoardItem(id, 28, 28))
+    )).filter(Boolean);
     if (!created.length) { clipRef.current = []; return false; }
     setItems((prev) => [...prev, ...created]);
     setSelection(created.map((r) => keyOf('asset', r.item_id)));
@@ -528,11 +529,9 @@ export default function BoardCanvas({ boardId, boardName, assets, onOpenAsset, s
   const duplicateSel = async () => {
     const ids = selectedAssets().map((i) => i.item_id);
     if (!ids.length) return;
-    const created = [];
-    for (const id of ids) {
-      const row = await window.refhub.duplicateBoardItem(id, 28, 28);
-      if (row) created.push(row);
-    }
+    const created = (await Promise.all(
+      ids.map((id) => window.refhub.duplicateBoardItem(id, 28, 28))
+    )).filter(Boolean);
     if (!created.length) return;
     setItems((prev) => [...prev, ...created]);
     setSelection(created.map((r) => keyOf('asset', r.item_id)));
@@ -780,6 +779,10 @@ export default function BoardCanvas({ boardId, boardName, assets, onOpenAsset, s
         onClick: run(() => onAskAI({ imageAssets: sa.map(({ id, file_path, thumb_path, width, height }) => ({ id, file_path, thumb_path, width, height })) })),
       });
     }
+    if (sa.length && onSendToAi) {
+      // 复制原图进剪贴板并打开 AI 面板：网页版 AI 粘贴即上传
+      list.push({ label: t('⇪ 发送图片到 AI'), onClick: run(() => onSendToAi(sa[0])) });
+    }
     if (sa.length) {
       list.push({ label: t('复制'), hint: 'Ctrl+C', onClick: run(copySelection) });
       list.push({ label: t('复制副本'), hint: t('Ctrl+D / Alt+拖'), onClick: run(duplicateSel) });
@@ -914,7 +917,7 @@ export default function BoardCanvas({ boardId, boardName, assets, onOpenAsset, s
             onContextMenu={(e) => openMenu(e, it, 'asset')}
           >
             <img
-              src={it.w * vp.scale > 500 ? origUrl(it) : thumbUrl(it)}
+              src={/* 显示宽度超过缩略图约2倍才换原图：避免略一放大就集体解码4K+原图 */ it.w * vp.scale > 900 ? origUrl(it) : thumbUrl(it)}
               draggable={false}
               alt=""
               style={it.flip ? { transform: 'scaleX(-1)' } : undefined}

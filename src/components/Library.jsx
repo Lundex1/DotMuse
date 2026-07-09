@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, memo } from 'react';
 import { t } from '../lib/i18n.js';
 
 export function thumbUrl(asset) {
@@ -6,7 +6,8 @@ export function thumbUrl(asset) {
   return `reflib://${asset.thumb_path ? 'thumb' : 'orig'}/${rel}`;
 }
 
-function CardImage({ asset }) {
+// memo：搜索框打字、筛选切换时不重渲染没变的卡片
+const CardImage = memo(function CardImage({ asset }) {
   const [loaded, setLoaded] = useState(false);
   const [err, setErr] = useState(false);
   if (err) return <div className="card-broken">{t('⚠ 图片损坏')}<br /><span>{t('点开后可删除，或到设置里一键清理')}</span></div>;
@@ -20,7 +21,7 @@ function CardImage({ asset }) {
       onError={() => setErr(true)}
     />
   );
-}
+});
 
 // 图板选择弹层（fixed 定位，不被卡片圆角裁剪）。pop.assetIds 支持批量。
 function BoardPicker({ pop, onClose, showToast, onChanged }) {
@@ -32,7 +33,8 @@ function BoardPicker({ pop, onClose, showToast, onChanged }) {
   }, []);
 
   const add = async (boardId) => {
-    for (const id of ids) await window.refhub.addToBoard(boardId, id);
+    // 批量走一次 IPC + 一个事务：几十张也不卡，且不会中途失败留半截
+    await window.refhub.addToBoardMany(boardId, ids);
     onChanged?.();
     showToast?.(ids.length > 1 ? t('已加入 {n} 张', { n: ids.length }) : t('已加入图板'));
     onClose();
@@ -71,7 +73,8 @@ function BoardPicker({ pop, onClose, showToast, onChanged }) {
   );
 }
 
-export function Waterfall({ assets, onOpenAsset, onRemove, showToast, onChanged, onDelete, selMode, selIds, onToggleSel, onAskAI, onTogglePin }) {
+// memo：父组件的输入框打字等无关渲染不再牵连整个瀑布流（数百张卡片）
+export const Waterfall = memo(function Waterfall({ assets, onOpenAsset, onRemove, showToast, onChanged, onDelete, selMode, selIds, onToggleSel, onAskAI, onSendToAi, onTogglePin }) {
   const [pop, setPop] = useState(null); // { assetIds, x, y }
   const [ctx, setCtx] = useState(null); // { x, y, asset } 卡片右键菜单
   const selected = (id) => selMode && selIds?.includes(id);
@@ -97,8 +100,9 @@ export function Waterfall({ assets, onOpenAsset, onRemove, showToast, onChanged,
             onContextMenu={(e) => { e.preventDefault(); if (!selMode) setCtx({ x: e.clientX, y: e.clientY, asset: a }); }}
             draggable={!selMode}
             onDragStart={(e) => {
-              e.dataTransfer.setData('text/asset-id', a.id);
-              e.dataTransfer.effectAllowed = 'copy';
+              // 升级为操作系统级文件拖拽：网页版 AI（豆包/Gemini 等）、PS 等外部软件都能接收
+              e.preventDefault();
+              window.refhub.startDrag(a.id);
             }}
           >
             <CardImage asset={a} />
@@ -165,6 +169,11 @@ export function Waterfall({ assets, onOpenAsset, onRemove, showToast, onChanged,
                 <span>{t('✦ 发给小灵')}</span>
               </div>
             )}
+            {onSendToAi && (
+              <div className="ctx-item" onClick={() => { const a = ctx.asset; setCtx(null); onSendToAi(a); }}>
+                <span>{t('⇪ 发送图片到 AI')}</span>
+              </div>
+            )}
             <div className="ctx-item" onClick={() => {
               const { x, asset } = ctx; setCtx(null);
               setPop({ assetIds: [asset.id], x: Math.min(x, window.innerWidth - 230), y: ctx.y });
@@ -197,9 +206,11 @@ export function Waterfall({ assets, onOpenAsset, onRemove, showToast, onChanged,
       )}
     </>
   );
-}
+});
 
-export default function Library({ refreshKey, onOpenAsset, showToast, onChanged }) {
+const PAGE = 500; // 每次加载的张数：底部「加载更多」按需追加
+
+export default function Library({ refreshKey, active = true, onOpenAsset, showToast, onChanged, onSendToAi }) {
   const [assets, setAssets] = useState([]);
   const [search, setSearch] = useState('');
   const [cats, setCats] = useState([]);
@@ -214,24 +225,43 @@ export default function Library({ refreshKey, onOpenAsset, showToast, onChanged 
   const toggleFold = () => setRailFold((v) => { const n = !v; localStorage.setItem('catRailFold', n ? '1' : '0'); return n; });
   // 分类内置顶
   const [pinBump, setPinBump] = useState(0);
-  const togglePin = async (a) => {
+  const togglePin = useCallback(async (a) => {
     const r = await window.refhub.toggleAssetPin(a.id, catId);
     if (r?.ok) { showToast?.(r.pinned ? t('已置顶，在这个分类里排最前') : t('已取消置顶')); setPinBump((b) => b + 1); }
-  };
+  }, [catId, showToast]);
 
   useEffect(() => {
+    if (!active) return; // 不在素材库页时不拉数据，切回来会因 active 变化补一次
     window.refhub.listCategories().then(setCats);
-  }, [refreshKey]);
+  }, [refreshKey, active]);
+
+  const [total, setTotal] = useState(0);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const queryOpts = () => ({
+    search: search || undefined,
+    categoryId: catId || undefined,
+  });
 
   useEffect(() => {
-    const t = setTimeout(() => {
-      window.refhub.listAssets({
-        search: search || undefined,
-        categoryId: catId || undefined,
-      }).then(setAssets);
+    if (!active) return;
+    const timer = setTimeout(() => {
+      const q = queryOpts();
+      window.refhub.listAssets({ ...q, limit: PAGE, offset: 0 }).then(setAssets);
+      window.refhub.countAssets(q).then((n) => setTotal(n || 0));
     }, 200);
-    return () => clearTimeout(t);
-  }, [search, refreshKey, catId, pinBump]);
+    return () => clearTimeout(timer);
+  }, [search, refreshKey, catId, pinBump, active]); // eslint-disable-line
+
+  // 「加载更多」：按当前筛选条件从已加载位置继续取一页
+  const loadMore = async () => {
+    setLoadingMore(true);
+    const rows = await window.refhub.listAssets({ ...queryOpts(), limit: PAGE, offset: assets.length });
+    setLoadingMore(false);
+    setAssets((prev) => {
+      const seen = new Set(prev.map((a) => a.id));
+      return [...prev, ...rows.filter((r) => !seen.has(r.id))];
+    });
+  };
 
   const addCat = async () => {
     const name = await window.appPrompt(t('新分类的名字：'));
@@ -250,24 +280,27 @@ export default function Library({ refreshKey, onOpenAsset, showToast, onChanged 
   };
 
   // ---------- 多选批量 ----------
-  const toggleSel = (id) => setSelIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+  const toggleSel = useCallback((id) => setSelIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id])), []);
   const exitSel = () => { setSelMode(false); setSelIds([]); };
   const selectAllVisible = () => setSelIds(assets.map((a) => a.id));
 
-  const delOne = async (a) => {
+  const delOne = useCallback(async (a) => {
     if (!confirm(t('从素材库彻底删除这张图？不可撤销（图板里的引用也会一并移除）。'))) return;
     await window.refhub.deleteAsset(a.id);
     setAssets((prev) => prev.filter((x) => x.id !== a.id));
+    setTotal((n) => Math.max(0, n - 1));
     showToast?.(t('已删除'));
     onChanged?.();
-  };
+  }, [showToast, onChanged]);
 
   const batchDelete = async () => {
     if (!selIds.length) return;
     if (!confirm(t('从素材库彻底删除选中的 {n} 张？不可撤销。', { n: selIds.length }))) return;
-    for (const id of selIds) await window.refhub.deleteAsset(id);
+    // 批量走一次 IPC + 一个事务
+    await window.refhub.deleteAssets(selIds);
     const gone = new Set(selIds);
     setAssets((prev) => prev.filter((a) => !gone.has(a.id)));
+    setTotal((n) => Math.max(0, n - selIds.length));
     showToast?.(t('已删除 {n} 张', { n: selIds.length }));
     setSelIds([]);
     onChanged?.();
@@ -307,7 +340,7 @@ export default function Library({ refreshKey, onOpenAsset, showToast, onChanged 
           <>
             <button className="primary" disabled={importing} onClick={importImages}>{importing ? t('导入中…') : t('＋ 导入图片')}</button>
             <button className="ghost" onClick={() => setSelMode(true)}>{t('多选')}</button>
-            <span className="count">{t('{n} 张', { n: assets.length })}</span>
+            <span className="count">{t('{n} 张', { n: total || assets.length })}</span>
           </>
         ) : (
           <div className="batch-bar">
@@ -343,7 +376,13 @@ export default function Library({ refreshKey, onOpenAsset, showToast, onChanged 
               onDrop={async (e) => {
                 e.preventDefault();
                 setDropCat(null);
-                const assetId = e.dataTransfer.getData('text/asset-id');
+                let assetId = e.dataTransfer.getData('text/asset-id');
+                // 素材卡片现在是系统级文件拖拽：文件名就是素材 id（`${id}.${ext}`）
+                if (!assetId && e.dataTransfer.files?.length) {
+                  const p = window.refhub.getFilePath(e.dataTransfer.files[0]);
+                  const cand = p ? p.replace(/\\/g, '/').split('/').pop().replace(/\.[^.]+$/, '') : '';
+                  if (cand && await window.refhub.getAsset(cand)) assetId = cand;
+                }
                 if (!assetId) return;
                 await window.refhub.addAssetToCategory(assetId, c.id);
                 setCats(await window.refhub.listCategories());
@@ -371,8 +410,16 @@ export default function Library({ refreshKey, onOpenAsset, showToast, onChanged 
             selMode={selMode}
             selIds={selIds}
             onToggleSel={toggleSel}
+            onSendToAi={onSendToAi}
             onTogglePin={catId ? togglePin : undefined}
           />
+          {assets.length < total && (
+            <div className="load-more">
+              <button className="ghost" disabled={loadingMore} onClick={loadMore}>
+                {loadingMore ? t('加载中…') : t('加载更多（已显示 {shown} / {total} 张）', { shown: assets.length, total })}
+              </button>
+            </div>
+          )}
         </div>
       </div>
       {batchPop && <BoardPicker pop={batchPop} onClose={() => setBatchPop(null)} showToast={showToast} onChanged={onChanged} />}

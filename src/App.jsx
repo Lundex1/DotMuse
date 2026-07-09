@@ -85,6 +85,7 @@ export default function App() {
     setDetailAsset(a);
     setDetailList(Array.isArray(list) && list.length > 1 ? list : null);
   }, []);
+  const [aiPasteReq, setAiPasteReq] = useState(null); // 「发送图片到 AI」触发网页面板自动粘贴
   const [toast, setToast] = useState(null);
   const [refreshKey, setRefreshKey] = useState(0);
   const [aiOpen, setAiOpen] = useState(false);
@@ -116,20 +117,50 @@ export default function App() {
     toastTimer.current = setTimeout(() => setToast(null), action ? 5000 : 2500);
   }, []);
 
+  // 发送图片到网页版 AI：复制进剪贴板 → 打开面板 → 尝试自动粘贴
+  const sendImgToAi = useCallback(async (a) => {
+    const r = await window.refhub.copyImageToClipboard(a.id);
+    // 主进程返回的错误是中文原文，过一遍 t() 让 en/ja 用户看到译文
+    if (!r?.ok) { showToast(`⚠ ${t(r?.error || '复制图片失败')}`); return; }
+    setAiOpen(true);
+    setAiPasteReq({ ts: Date.now() });
+    showToast(t('已复制图片并打开 AI 面板；如输入框没自动出现，点一下输入框按 Ctrl+V'));
+  }, [showToast]);
+
+  // 用户直接操作后的立即刷新（稳定引用，保住下游 memo 不被击穿）
+  const notifyChanged = useCallback(() => setRefreshKey((k) => k + 1), []);
+  // 高频事件（批量导入等）合并成一次刷新，别让各页面反复全量拉数据
+  const refreshDebounce = useRef(null);
+  const bumpRefresh = useCallback(() => {
+    clearTimeout(refreshDebounce.current);
+    refreshDebounce.current = setTimeout(() => setRefreshKey((k) => k + 1), 300);
+  }, []);
+
   useEffect(() => {
     const off = window.refhub.onAssetAdded((asset) => {
       const activeBoard = Number(localStorage.getItem('activeBoardId') || 0);
       if (asset.__origin === 'capture' && activeBoard) window.refhub.addToBoard(activeBoard, asset.id);
+      // 隐藏素材（.dlb 仅图板导入等）没有真的"入库"，不弹入库提示
+      if (asset.hidden) { bumpRefresh(); return; }
       showToast(
         t('已入库 · {title}（点击查看）', { title: (asset.page_title || asset.note || asset.id).slice(0, 26) }),
         () => { setView('library'); setDetailAsset(asset); }
       );
-      setRefreshKey((k) => k + 1);
+      bumpRefresh();
     });
     const offFail = window.refhub.onCaptureFailed((msg) => showToast(`⚠ ${msg}`));
-    const offLib = window.refhub.onLibraryChanged(() => setRefreshKey((k) => k + 1));
+    const offLib = window.refhub.onLibraryChanged(() => bumpRefresh());
     return () => { off(); offFail(); offLib(); };
-  }, [showToast]);
+  }, [showToast, bumpRefresh]);
+
+  // 全局兜底：没被任何组件接住的拖拽一律取消默认行为，
+  // 否则 Chromium 会把整个界面导航成被拖的图片/链接（软件界面直接被顶掉）
+  useEffect(() => {
+    const prevent = (e) => e.preventDefault();
+    window.addEventListener('dragover', prevent);
+    window.addEventListener('drop', prevent);
+    return () => { window.removeEventListener('dragover', prevent); window.removeEventListener('drop', prevent); };
+  }, []);
 
   useEffect(() => {
     const onKey = (e) => {
@@ -206,10 +237,10 @@ export default function App() {
       </div>
       <div className="main">
         <div className={'pane' + (view === 'library' ? ' visible' : '')}>
-          <Library refreshKey={refreshKey} onOpenAsset={openAsset} showToast={showToast} onChanged={() => setRefreshKey((k) => k + 1)} />
+          <Library refreshKey={refreshKey} active={view === 'library'} onOpenAsset={openAsset} showToast={showToast} onChanged={notifyChanged} onSendToAi={sendImgToAi} />
         </div>
         <div className={'pane' + (view === 'boards' ? ' visible' : '')}>
-          <Boards refreshKey={refreshKey} onOpenAsset={openAsset} showToast={showToast} openRequest={boardReq} />
+          <Boards refreshKey={refreshKey} active={view === 'boards'} onOpenAsset={openAsset} showToast={showToast} openRequest={boardReq} onSendToAi={sendImgToAi} />
         </div>
         <div className={'pane' + (view === 'ideas' ? ' visible' : '')}>
           <IdeasView showToast={showToast} openRequest={ideaReq} />
@@ -223,7 +254,7 @@ export default function App() {
           {theme === 'light' ? <SunIcon /> : <MoonIcon />}
         </button>
       </div>
-      <AiPanel open={aiOpen} />
+      <AiPanel open={aiOpen} pasteRequest={aiPasteReq} showToast={showToast} />
       {detailAsset && (
         <AssetDetail asset={detailAsset} list={detailList} onNavigate={setDetailAsset} onClose={() => setDetailAsset(null)}
           onOpenInBrowser={openInBrowser} onChanged={() => setRefreshKey((k) => k + 1)} showToast={showToast} />

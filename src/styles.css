@@ -1277,3 +1277,23 @@ html[lang='en'] .fr-sub, html[lang='en'] .rail-foot { letter-spacing: 0.5px; }
 /* 西文/日文普遍比中文长：弹层与菜单项允许换行兜底，不裁字 */
 html[lang='en'] .ctx-item span, html[lang='ja'] .ctx-item span { white-space: normal; }
 html[lang='en'] .row-hint, html[lang='ja'] .row-hint { line-height: 1.65; }
+
+/* AI 面板拖拽调宽期间：webview 全部退出鼠标命中，指针事件留给宿主页，
+   否则拖到浏览器页的网页上就会被吞事件、拉不动 */
+html.ai-resizing webview { pointer-events: none !important; }
+html.ai-resizing { cursor: ew-resize; }
+
+/* 网页 AI 拖拽接收罩：拖网页图片时出现，接住后直发网页 AI（不入库） */
+.ai-webview { position: relative; }
+.aiweb-drop {
+  /* inset 0：罩子占满整个 webview 区域，不留会让拖拽事件漏进网页的缝（悬停闪烁） */
+  position: absolute; inset: 0; z-index: 6;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--accent-soft);
+  border: 2px dashed var(--accent); border-radius: 12px;
+  font-size: 14.5px; font-weight: 600; color: var(--accent-deep);
+  text-align: center; padding: 16px; backdrop-filter: blur(2px);
+}
+
+/* 素材库分页：底部「加载更多」 */
+.load-more { display: flex; justify-content: center; padding: 18px 0 28px; }

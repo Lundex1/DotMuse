@@ -119,6 +119,18 @@ function init(dbPath) {
   try { db.exec('ALTER TABLE assets ADD COLUMN hidden INTEGER DEFAULT 0'); } catch (_) {}
   // 合集内置顶时间（null = 未置顶）
   try { db.exec('ALTER TABLE asset_categories ADD COLUMN pinned_at TEXT'); } catch (_) {}
+  // 按 asset_id 的反向查找索引：删素材 / 查隐藏孤儿不再全表扫
+  try { db.exec('CREATE INDEX IF NOT EXISTS idx_board_items_asset ON board_items(asset_id)'); } catch (_) {}
+  try { db.exec('CREATE INDEX IF NOT EXISTS idx_asset_categories_cat ON asset_categories(category_id)'); } catch (_) {}
+  // 历史数据卫生：老版本删除不级联留下的残留关联/悬空图板项，启动时一次清掉
+  try {
+    db.exec(`
+      DELETE FROM board_items WHERE asset_id NOT IN (SELECT id FROM assets);
+      DELETE FROM asset_tags WHERE asset_id NOT IN (SELECT id FROM assets);
+      DELETE FROM asset_categories WHERE asset_id NOT IN (SELECT id FROM assets);
+      DELETE FROM asset_facets WHERE asset_id NOT IN (SELECT id FROM assets);
+    `);
+  } catch (_) {}
   // 首次启动播种场景设计常用大类
   const catCount = db.prepare('SELECT COUNT(*) AS n FROM categories').get().n;
   if (catCount === 0) {
@@ -174,6 +186,10 @@ function updateAsset(id, fields) {
 }
 
 function setTags(assetId, tagNames) {
+  db.transaction(() => { setTagsInner(assetId, tagNames); })();
+}
+
+function setTagsInner(assetId, tagNames) {
   db.prepare('DELETE FROM asset_tags WHERE asset_id = ?').run(assetId);
   const insTag = db.prepare('INSERT OR IGNORE INTO tags (name) VALUES (?)');
   const getTag = db.prepare('SELECT id FROM tags WHERE name = ?');
@@ -212,10 +228,11 @@ function listAssets({ search, boardId, categoryId, facets, limit = 500, offset =
     });
   }
   if (search) {
-    sql += ` AND (a.page_title LIKE @q OR a.author LIKE @q OR a.note LIKE @q
+    // %/_ 转义：搜"100%"就是找字面的 100%，不是通配
+    sql += ` AND (a.page_title LIKE @q ESCAPE '\\' OR a.author LIKE @q ESCAPE '\\' OR a.note LIKE @q ESCAPE '\\'
              OR a.id IN (SELECT at.asset_id FROM asset_tags at
-                         JOIN tags t ON t.id = at.tag_id WHERE t.name LIKE @q))`;
-    params.q = `%${search}%`;
+                         JOIN tags t ON t.id = at.tag_id WHERE t.name LIKE @q ESCAPE '\\'))`;
+    params.q = `%${String(search).replace(/[\\%_]/g, (m) => '\\' + m)}%`;
   }
   if (!boardId && categoryId) {
     sql += ' ORDER BY (ac.pinned_at IS NULL), ac.pinned_at DESC, a.created_at DESC LIMIT @limit OFFSET @offset';
@@ -223,6 +240,37 @@ function listAssets({ search, boardId, categoryId, facets, limit = 500, offset =
     sql += ' ORDER BY a.created_at DESC LIMIT @limit OFFSET @offset';
   }
   return db.prepare(sql).all(params).map(attachTags);
+}
+
+// 与 listAssets 同条件的总数：素材库「加载更多」分页显示 已显示/总数 用
+function countAssets({ search, boardId, categoryId, facets } = {}) {
+  let sql, params;
+  if (boardId) {
+    sql = 'SELECT COUNT(*) AS n FROM assets a JOIN board_items bi ON bi.asset_id = a.id WHERE bi.board_id = @boardId';
+    params = { boardId };
+  } else if (categoryId) {
+    sql = `SELECT COUNT(*) AS n FROM assets a
+           JOIN asset_categories ac ON ac.asset_id = a.id AND ac.category_id = @categoryId
+           WHERE COALESCE(a.hidden, 0) = 0`;
+    params = { categoryId };
+  } else {
+    sql = 'SELECT COUNT(*) AS n FROM assets a WHERE COALESCE(a.hidden, 0) = 0';
+    params = {};
+  }
+  if (Array.isArray(facets)) {
+    facets.forEach((f, i) => {
+      sql += ` AND a.id IN (SELECT af.asset_id FROM asset_facets af WHERE af.facet = @f${i} AND af.value = @v${i})`;
+      params[`f${i}`] = f.facet;
+      params[`v${i}`] = f.value;
+    });
+  }
+  if (search) {
+    sql += ` AND (a.page_title LIKE @q ESCAPE '\\' OR a.author LIKE @q ESCAPE '\\' OR a.note LIKE @q ESCAPE '\\'
+             OR a.id IN (SELECT at.asset_id FROM asset_tags at
+                         JOIN tags t ON t.id = at.tag_id WHERE t.name LIKE @q ESCAPE '\\'))`;
+    params.q = `%${String(search).replace(/[\\%_]/g, (m) => '\\' + m)}%`;
+  }
+  return db.prepare(sql).get(params).n;
 }
 
 // 合集内置顶开关：置顶的图在该合集排最前，再次调用取消
@@ -237,10 +285,23 @@ function toggleAssetPin(assetId, categoryId) {
   return { ok: true, pinned: true };
 }
 
-function deleteAsset(id) {
+function deleteAssetRows(id) {
   db.prepare('DELETE FROM board_items WHERE asset_id = ?').run(id);
   db.prepare('DELETE FROM asset_tags WHERE asset_id = ?').run(id);
+  db.prepare('DELETE FROM asset_categories WHERE asset_id = ?').run(id);
+  db.prepare('DELETE FROM asset_facets WHERE asset_id = ?').run(id);
   db.prepare('DELETE FROM assets WHERE id = ?').run(id);
+}
+
+function deleteAsset(id) {
+  // 事务 + 全量级联：中途断电不留半截，合集/分面计数不虚高
+  db.transaction(deleteAssetRows)(id);
+  return true;
+}
+
+// 批量删除：一个事务跑完，「多选删除」一次 IPC 完成且原子
+function deleteAssets(ids) {
+  db.transaction((list) => { for (const id of list) deleteAssetRows(id); })(ids || []);
   return true;
 }
 
@@ -266,21 +327,34 @@ function getOrCreateBoardByName(name) {
 }
 
 function renameBoard(id, name) {
-  db.prepare('UPDATE boards SET name = ? WHERE id = ?').run(name, id);
+  // 重名（UNIQUE 冲突）不抛异常：带 __dupName 标记回去让前端提示
+  try {
+    db.prepare('UPDATE boards SET name = ? WHERE id = ?').run(name, id);
+  } catch (_) {
+    const cur = db.prepare('SELECT * FROM boards WHERE id = ?').get(id);
+    return cur ? { ...cur, __dupName: true } : null;
+  }
   return db.prepare('SELECT * FROM boards WHERE id = ?').get(id);
 }
 
 function deleteBoard(id) {
   // 只删图板（引用层），库里的图片不受影响
-  db.prepare('DELETE FROM board_items WHERE board_id = ?').run(id);
-  db.prepare('DELETE FROM boards WHERE id = ?').run(id);
+  db.transaction(() => {
+    db.prepare('DELETE FROM board_items WHERE board_id = ?').run(id);
+    db.prepare('DELETE FROM boards WHERE id = ?').run(id);
+  })();
   // "仅图板显示"的隐藏图：最后一个图板引用没了就交给主进程物理清理，避免不可见占盘
-  const orphans = db.prepare(`
+  return { ok: true, orphans: listHiddenOrphans() };
+}
+
+// 隐藏图（仅图板 / AI 临时参考图）的孤儿：没有任何图板引用。
+// 启动时和删图板时由主进程物理清理文件
+function listHiddenOrphans() {
+  return db.prepare(`
     SELECT a.id, a.file_path, a.thumb_path FROM assets a
     WHERE COALESCE(a.hidden, 0) = 1
       AND NOT EXISTS (SELECT 1 FROM board_items bi WHERE bi.asset_id = a.id)
   `).all();
-  return { ok: true, orphans };
 }
 
 // 单个图板项（连素材字段一起返回，供画布直接摆放）
@@ -301,8 +375,22 @@ function addAssetToBoard(boardId, assetId) {
   return getBoardItem(r.lastInsertRowid);
 }
 
+// 批量入板：一个事务完成（多选「加入图板」一次 IPC）
+function addAssetsToBoard(boardId, assetIds) {
+  const out = [];
+  db.transaction(() => {
+    for (const id of assetIds || []) {
+      const it = addAssetToBoard(boardId, id);
+      if (it) out.push(it);
+    }
+  })();
+  return out;
+}
+
 // 撤销「移出图板」时按原布局恢复（总是新插入，不做幂等）
 function restoreBoardItem(boardId, assetId, layout = {}) {
+  // 撤销前素材可能已被从库中删除：不插入悬空引用（图板计数会虚高）
+  if (!db.prepare('SELECT 1 FROM assets WHERE id = ?').get(assetId)) return null;
   const r = db.prepare(`
     INSERT INTO board_items (board_id, asset_id, x, y, w, z, locked, flip, rot)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -368,13 +456,15 @@ function renameCategory(id, name) {
 
 // 首启按创作方向替换种子分类：只清掉还没挂图的空分类，有图的绝不动
 function replaceSeedCategories(names) {
-  const empty = db.prepare(`
-    SELECT c.id FROM categories c
-    LEFT JOIN asset_categories ac ON ac.category_id = c.id
-    GROUP BY c.id HAVING COUNT(ac.asset_id) = 0
-  `).all();
-  for (const r of empty) db.prepare('DELETE FROM categories WHERE id = ?').run(r.id);
-  for (const n of names || []) addCategory(n);
+  db.transaction(() => {
+    const empty = db.prepare(`
+      SELECT c.id FROM categories c
+      LEFT JOIN asset_categories ac ON ac.category_id = c.id
+      GROUP BY c.id HAVING COUNT(ac.asset_id) = 0
+    `).all();
+    for (const r of empty) db.prepare('DELETE FROM categories WHERE id = ?').run(r.id);
+    for (const n of names || []) addCategory(n);
+  })();
   return true;
 }
 
@@ -401,13 +491,16 @@ function setAssetCategories(assetId, names) {
 // ---------- 分面归档（题材/风格/用途/色调） ----------
 
 function setAssetFacets(assetId, fx = {}) {
-  db.prepare('DELETE FROM asset_facets WHERE asset_id = ?').run(assetId);
-  const ins = db.prepare('INSERT OR IGNORE INTO asset_facets (asset_id, facet, value) VALUES (?, ?, ?)');
-  const norm = (s) => String(s || '').trim();
-  if (norm(fx.subject)) ins.run(assetId, 'subject', norm(fx.subject));
-  for (const s of fx.styles || []) if (norm(s)) ins.run(assetId, 'style', norm(s));
-  for (const u of fx.uses || []) if (norm(u)) ins.run(assetId, 'use', norm(u));
-  if (norm(fx.tone)) ins.run(assetId, 'tone', norm(fx.tone));
+  // 事务：清旧写新一体完成，中断不会留下"分面被清了还没写回"的半截状态
+  db.transaction(() => {
+    db.prepare('DELETE FROM asset_facets WHERE asset_id = ?').run(assetId);
+    const ins = db.prepare('INSERT OR IGNORE INTO asset_facets (asset_id, facet, value) VALUES (?, ?, ?)');
+    const norm = (s) => String(s || '').trim();
+    if (norm(fx.subject)) ins.run(assetId, 'subject', norm(fx.subject));
+    for (const s of fx.styles || []) if (norm(s)) ins.run(assetId, 'style', norm(s));
+    for (const u of fx.uses || []) if (norm(u)) ins.run(assetId, 'use', norm(u));
+    if (norm(fx.tone)) ins.run(assetId, 'tone', norm(fx.tone));
+  })();
 }
 
 function listFacets() {
@@ -494,9 +587,9 @@ function deleteWidget(id) {
 }
 
 module.exports = {
-  init, close, insertAsset, getAsset, updateAsset, listAssets, deleteAsset, findAssetByHash, setAssetHidden,
+  init, close, insertAsset, getAsset, updateAsset, listAssets, countAssets, deleteAsset, deleteAssets, findAssetByHash, setAssetHidden, listHiddenOrphans,
   listBoards, getOrCreateBoardByName, renameBoard, deleteBoard,
-  addAssetToBoard, removeBoardItem, updateBoardItem, getBoardItem, duplicateBoardItem, restoreBoardItem,
+  addAssetToBoard, addAssetsToBoard, removeBoardItem, updateBoardItem, getBoardItem, duplicateBoardItem, restoreBoardItem,
   createNote, listNotes, getNote, deleteNote,
   createIdea, listIdeas, getIdea, updateIdea, deleteIdea,
   listCategories, addCategory, deleteCategory, renameCategory, categoryNames, setAssetCategories, addAssetToCategory, toggleAssetPin, replaceSeedCategories,

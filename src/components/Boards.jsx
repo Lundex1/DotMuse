@@ -4,7 +4,7 @@ import BoardCanvas from './BoardCanvas.jsx';
 import { exportBoardImage } from '../lib/exportBoard.js';
 import { t } from '../lib/i18n.js';
 
-export default function Boards({ refreshKey, onOpenAsset, showToast, openRequest }) {
+export default function Boards({ refreshKey, active = true, onOpenAsset, showToast, openRequest, onSendToAi }) {
   const [boards, setBoards] = useState([]);
   const [current, setCurrent] = useState(null);
   const [assets, setAssets] = useState([]);
@@ -12,7 +12,10 @@ export default function Boards({ refreshKey, onOpenAsset, showToast, openRequest
   const openTsRef = React.useRef(0);
 
   const loadBoards = useCallback(() => window.refhub.listBoards().then(setBoards), []);
-  useEffect(() => { loadBoards(); }, [refreshKey, loadBoards]);
+  useEffect(() => {
+    if (!active) return; // 不在图板页时不拉数据，切回来会因 active 变化补一次
+    loadBoards();
+  }, [refreshKey, loadBoards, active]);
 
   // 全局搜索直达某个图板
   useEffect(() => {
@@ -24,8 +27,9 @@ export default function Boards({ refreshKey, onOpenAsset, showToast, openRequest
   useEffect(() => {
     // mode 也作为依赖：画布↔瀑布流切换时重新读库，
     // 否则画布重挂载拿到的是打开图板时的旧坐标，布局会错乱
+    if (!active) return;
     if (current) window.refhub.boardAssets(current.id).then(setAssets);
-  }, [current, refreshKey, mode]);
+  }, [current, refreshKey, mode, active]);
 
   const [nameEdit, setNameEdit] = useState(null); // { id, value } 改名中
 
@@ -75,8 +79,10 @@ export default function Boards({ refreshKey, onOpenAsset, showToast, openRequest
     const name = (value || '').trim();
     if (!name || name === oldName) return;
     const updated = await window.refhub.renameBoard(id, name);
+    // 重名冲突：db 层带 __dupName 标记回来，明确提示而不是静默失败
+    if (updated?.__dupName) { showToast?.(t('⚠ 已有叫「{name}」的图板，换个名字吧', { name })); return; }
     loadBoards();
-    if (current?.id === id) setCurrent(updated);
+    if (current?.id === id && updated) setCurrent(updated);
     showToast?.(t('已重命名'));
   };
 
@@ -128,10 +134,10 @@ export default function Boards({ refreshKey, onOpenAsset, showToast, openRequest
           <button className="danger" onClick={() => deleteBoard(current)}>{t('删除')}</button>
         </div>
         {mode === 'canvas' ? (
-          <BoardCanvas boardId={current.id} boardName={current.name} assets={assets} onOpenAsset={onOpenAsset} showToast={showToast} />
+          <BoardCanvas boardId={current.id} boardName={current.name} assets={assets} onOpenAsset={onOpenAsset} showToast={showToast} onSendToAi={onSendToAi} />
         ) : (
           <div className="waterfall-wrap">
-            <Waterfall assets={assets} onOpenAsset={onOpenAsset} onRemove={removeFromBoard} />
+            <Waterfall assets={assets} onOpenAsset={onOpenAsset} onRemove={removeFromBoard} onSendToAi={onSendToAi} />
           </div>
         )}
       </>

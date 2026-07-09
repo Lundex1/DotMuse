@@ -316,7 +316,17 @@ function ingestImageBuffer(buf, { ext = 'png', sourceUrl = null, pageUrl = null,
   const dup = db.findAssetByHash(hash);
   if (dup) {
     console.log('[ingest] 查重命中，跳过重复入库:', dup.id);
-    if (!silentDup && mainWindow) mainWindow.webContents.send('capture-failed', '这张图已经在素材库里了，跳过重复入库');
+    // 命中的是"未入库"隐藏图（.dlb 仅图板等）而这次是真入库：就地转正，
+    // 否则会误报"已在素材库"但库里永远看不到它
+    if (dup.hidden && !hidden) {
+      db.setAssetHidden(dup.id, 0);
+      const promoted = { ...dup, hidden: 0 };
+      for (const w of BrowserWindow.getAllWindows()) {
+        try { w.webContents.send('asset-added', { ...promoted, __origin: origin }); } catch (_) {}
+      }
+      return { ...promoted, __dup: true };
+    }
+    if (!silentDup && mainWindow) mainWindow.webContents.send('capture-failed', T('这张图已经在素材库里了，跳过重复入库'));
     return { ...dup, __dup: true };
   }
   const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
@@ -423,6 +433,17 @@ function stopClipboardWatch() {
 app.whenReady().then(() => {
   ensureLibraryDirs();
   db.init(path.join(LIBRARY_ROOT, 'refhub.db'));
+
+  // 启动清扫：失去全部图板引用的隐藏图（.dlb 仅图板 / 从画布逐张移出的图）
+  // 连文件一起回收，避免不可见占盘
+  try {
+    for (const o of db.listHiddenOrphans()) {
+      try { fs.unlinkSync(path.join(ORIGINALS_DIR, o.file_path)); } catch (_) {}
+      if (o.thumb_path) { try { fs.unlinkSync(path.join(THUMBS_DIR, o.thumb_path)); } catch (_) {} }
+      db.deleteAsset(o.id);
+    }
+  } catch (_) {}
+
   // 内嵌网页语言协商跟随应用语言（未手动选择时=系统语言）
   applyAcceptLanguage(uiLang());
 
@@ -458,8 +479,29 @@ app.whenReady().then(() => {
 
   ipcMain.handle('capture-image', (_e, payload) => captureImage(payload));
   ipcMain.handle('list-assets', (_e, opts) => db.listAssets(opts || {}));
+  ipcMain.handle('count-assets', (_e, opts) => db.countAssets(opts || {}));
   ipcMain.handle('get-asset', (_e, id) => db.getAsset(id));
-  ipcMain.handle('delete-asset', (_e, id) => db.deleteAsset(id));
+  // 删除素材 = 数据行 + 原图 + 缩略图一起删（界面承诺的就是"彻底删除"）
+  const unlinkAssetFiles = (a) => {
+    if (!a) return;
+    try { fs.unlinkSync(path.join(ORIGINALS_DIR, a.file_path)); } catch (_) {}
+    if (a.thumb_path) { try { fs.unlinkSync(path.join(THUMBS_DIR, a.thumb_path)); } catch (_) {} }
+  };
+  ipcMain.handle('delete-asset', (_e, id) => {
+    const a = db.getAsset(id);
+    db.deleteAsset(id);
+    unlinkAssetFiles(a);
+    return true;
+  });
+  // 批量删除：数据库一个事务，随后统一清文件
+  ipcMain.handle('delete-assets', (_e, ids) => {
+    const rows = (ids || []).map((id) => db.getAsset(id)).filter(Boolean);
+    db.deleteAssets(ids || []);
+    for (const a of rows) unlinkAssetFiles(a);
+    return true;
+  });
+  // 批量入板：一次 IPC + 一个事务
+  ipcMain.handle('add-to-board-many', (_e, boardId, ids) => db.addAssetsToBoard(boardId, ids || []));
   ipcMain.handle('update-asset', (_e, id, fields) => db.updateAsset(id, fields));
   ipcMain.handle('list-boards', () => db.listBoards());
   ipcMain.handle('create-board', (_e, name) => db.getOrCreateBoardByName(name));
@@ -475,6 +517,46 @@ app.whenReady().then(() => {
     return true;
   });
   ipcMain.handle('asset-unhide', (_e, id) => db.setAssetHidden(id, 0));
+  // 把素材原图写入系统剪贴板（发送到网页版 AI：粘贴即上传）
+  ipcMain.handle('copy-image-clipboard', (_e, assetId) => {
+    try {
+      const a = db.getAsset(assetId);
+      if (!a) return { ok: false, error: '素材不存在' };
+      const img = nativeImage.createFromPath(path.join(ORIGINALS_DIR, a.file_path));
+      if (img.isEmpty()) return { ok: false, error: '这张图的格式无法复制为图片' };
+      clipboard.writeImage(img);
+      return { ok: true };
+    } catch (e) { return { ok: false, error: e.message }; }
+  });
+  // 素材卡片的拖拽升级为操作系统级文件拖拽：网页端 AI / PS 等外部软件都能接收
+  ipcMain.on('asset-start-drag', (event, assetId) => {
+    try {
+      const a = db.getAsset(assetId);
+      if (!a) return;
+      const abs = path.join(ORIGINALS_DIR, a.file_path);
+      let icon = nativeImage.createFromPath(a.thumb_path ? path.join(THUMBS_DIR, a.thumb_path) : abs);
+      if (icon.isEmpty()) icon = nativeImage.createFromPath(path.join(__dirname, '..', 'build', 'icon.png'));
+      if (!icon.isEmpty()) icon = icon.resize({ width: 96 });
+      event.sender.startDrag({ file: abs, icon });
+    } catch (_) {}
+  });
+  // 网页图片直发网页 AI（不入库）：带浏览分区登录态下载原图字节，交回渲染层解码
+  ipcMain.handle('fetch-image-bytes', async (_e, url) => {
+    try {
+      const dl = await downloadFirstOk(upgradeCandidates(url, null));
+      if (!dl) return { ok: false, error: '下载失败' };
+      return { ok: true, buf: dl.buf, contentType: dl.contentType };
+    } catch (e) { return { ok: false, error: e.message }; }
+  });
+  // 渲染层解码转成 PNG 后写系统剪贴板（webp/avif 由渲染层转格式，这里只收 PNG）
+  ipcMain.handle('copy-image-buffer', (_e, buf) => {
+    try {
+      const img = nativeImage.createFromBuffer(Buffer.from(buf));
+      if (img.isEmpty()) return { ok: false, error: '这张图的格式无法复制为图片' };
+      clipboard.writeImage(img);
+      return { ok: true };
+    } catch (e) { return { ok: false, error: e.message }; }
+  });
   // 渲染层切换语言时同步给主进程：弹窗语言、空种子分类改名、内嵌网页 Accept-Language
   ipcMain.handle('set-lang', (_e, lang) => {
     const L = ['zh', 'en', 'ja'].includes(lang) ? lang : 'zh';
@@ -510,11 +592,13 @@ app.whenReady().then(() => {
     if (img.isEmpty()) return { ok: false, error: '剪贴板里没有图片' };
     return { ok: true, asset: ingestImageBuffer(img.toPNG(), { ext: 'png', note: '剪贴板粘贴', origin: 'paste' }) };
   });
-  ipcMain.handle('import-file', (_e, filePath) => {
+  ipcMain.handle('import-file', (_e, filePath, opts) => {
     try {
       const buf = fs.readFileSync(filePath);
       const ext = (path.extname(filePath).slice(1) || 'png').toLowerCase();
-      return { ok: true, asset: ingestImageBuffer(buf, { ext, pageTitle: path.basename(filePath), note: '本地导入', origin: 'file' }) };
+      // opts.hidden：临时参考图，不出现在素材库（与 .dlb「仅图板」同机制）
+      const hidden = !!(opts && opts.hidden);
+      return { ok: true, asset: ingestImageBuffer(buf, { ext, pageTitle: path.basename(filePath), note: '本地导入', origin: 'file', hidden, silentDup: hidden }) };
     } catch (e) { return { ok: false, error: e.message }; }
   });
   // 素材库「导入图片」：弹系统选择框（可多选），批量入库，走查重
@@ -533,13 +617,17 @@ app.whenReady().then(() => {
         const r = ingestImageBuffer(buf, { ext, pageTitle: path.basename(fp), note: '本地导入', origin: 'file' });
         if (r && r.__dup) dup++; else added++;
       } catch (_) { failed++; }
+      // 每张之间让出事件循环：批量导入不再冻住整个界面
+      await new Promise((res) => setImmediate(res));
     }
     return { ok: true, added, dup, failed, total: pick.filePaths.length };
   });
-  ipcMain.handle('import-url', async (_e, url) => {
+  ipcMain.handle('import-url', async (_e, url, opts) => {
     const dl = await downloadFirstOk(upgradeCandidates(url, null));
     if (!dl) return { ok: false, error: '下载失败' };
-    return { ok: true, asset: ingestImageBuffer(dl.buf, { ext: extFromUrlOrType(dl.url, dl.contentType), sourceUrl: dl.url, origin: 'url' }) };
+    // opts.hidden：临时参考图，不出现在素材库（与 .dlb「仅图板」同机制）
+    const hidden = !!(opts && opts.hidden);
+    return { ok: true, asset: ingestImageBuffer(dl.buf, { ext: extFromUrlOrType(dl.url, dl.contentType), sourceUrl: dl.url, origin: 'url', hidden, silentDup: hidden }) };
   });
   // 图板悬浮小窗（置顶，可一边干活一边看参考）
   ipcMain.handle('open-board-float', (_e, boardId, name) => {
@@ -821,6 +909,8 @@ app.whenReady().then(() => {
           db.updateAsset(asset.id, { tags: item.meta.tags });
         }
         db.restoreBoardItem(board.id, asset.id, item.layout || {});
+        // 每张之间让出事件循环：大图板导入不冻住界面
+        await new Promise((res) => setImmediate(res));
       }
       for (const w of manifest.widgets || []) {
         const nw = db.addWidget(board.id, { kind: w.kind, x: w.x, y: w.y, w: w.w, h: w.h, z: w.z || 0 });
