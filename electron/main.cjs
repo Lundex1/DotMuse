@@ -183,7 +183,8 @@ const PERSONA_SEED_CATS = {
   },
 };
 
-// 切换语言时：空的种子分类（还没挂图）跟着改名；有图的是用户数据绝不动
+// 切换语言时：名字仍是种子原名的分类跟随语言改名——有没有图都改，
+// 改的只是标签、图片不受影响；用户自己改过名的分类永远不匹配、永远不动
 function renameSeedCats(targetLang) {
   const langs = ['zh', 'en', 'ja'];
   const cats = db.listCategories();
@@ -193,7 +194,7 @@ function renameSeedCats(targetLang) {
       const variants = langs.map((L) => PERSONA_SEED_CATS[L][personaKey][i]);
       const target = PERSONA_SEED_CATS[targetLang][personaKey][i];
       for (const c of cats) {
-        if (c.asset_count === 0 && variants.includes(c.name) && c.name !== target) {
+        if (variants.includes(c.name) && c.name !== target) {
           db.renameCategory(c.id, target);
         }
       }
@@ -444,6 +445,8 @@ app.whenReady().then(() => {
     }
   } catch (_) {}
 
+  // 启动时把还叫种子原名的分类对齐到当前语言（补上「切语言前就有图」的漏网分类）
+  try { renameSeedCats(uiLang()); } catch (_) {}
   // 内嵌网页语言协商跟随应用语言（未手动选择时=系统语言）
   applyAcceptLanguage(uiLang());
 
