@@ -21,6 +21,8 @@ contextBridge.exposeInMainWorld('refhub', {
   listCategories: () => ipcRenderer.invoke('list-categories'),
   addCategory: (name) => ipcRenderer.invoke('add-category', name),
   addAssetToCategory: (assetId, categoryId) => ipcRenderer.invoke('add-asset-category', assetId, categoryId),
+  removeAssetFromCategory: (assetId, categoryId) => ipcRenderer.invoke('remove-asset-category', assetId, categoryId),
+  removeAssetsFromCategory: (assetIds, categoryId) => ipcRenderer.invoke('remove-assets-category', assetIds, categoryId),
   toggleAssetPin: (assetId, categoryId) => ipcRenderer.invoke('toggle-asset-pin', assetId, categoryId),
   deleteCategory: (id) => ipcRenderer.invoke('delete-category', id),
   createIdea: () => ipcRenderer.invoke('create-idea'),

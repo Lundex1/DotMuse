@@ -478,6 +478,21 @@ function addAssetToCategory(assetId, categoryId) {
   return true;
 }
 
+// 把素材移出某个合集：只解绑关联（含置顶状态），素材本身不受影响
+function removeAssetFromCategory(assetId, categoryId) {
+  db.prepare('DELETE FROM asset_categories WHERE asset_id = ? AND category_id = ?').run(assetId, categoryId);
+  return true;
+}
+
+// 批量移出（多选一次完成）
+function removeAssetsFromCategory(assetIds, categoryId) {
+  db.transaction(() => {
+    const del = db.prepare('DELETE FROM asset_categories WHERE asset_id = ? AND category_id = ?');
+    for (const id of assetIds || []) del.run(id, categoryId);
+  })();
+  return true;
+}
+
 // AI 归档结果：按名称把素材挂进大类（未知名称忽略）
 function setAssetCategories(assetId, names) {
   const get = db.prepare('SELECT id FROM categories WHERE name = ?');
@@ -592,7 +607,7 @@ module.exports = {
   addAssetToBoard, addAssetsToBoard, removeBoardItem, updateBoardItem, getBoardItem, duplicateBoardItem, restoreBoardItem,
   createNote, listNotes, getNote, deleteNote,
   createIdea, listIdeas, getIdea, updateIdea, deleteIdea,
-  listCategories, addCategory, deleteCategory, renameCategory, categoryNames, setAssetCategories, addAssetToCategory, toggleAssetPin, replaceSeedCategories,
+  listCategories, addCategory, deleteCategory, renameCategory, categoryNames, setAssetCategories, addAssetToCategory, removeAssetFromCategory, removeAssetsFromCategory, toggleAssetPin, replaceSeedCategories,
   setAssetFacets, listFacets,
   listWidgets, addWidget, updateWidget, deleteWidget,
 };

@@ -74,7 +74,7 @@ function BoardPicker({ pop, onClose, showToast, onChanged }) {
 }
 
 // memo：父组件的输入框打字等无关渲染不再牵连整个瀑布流（数百张卡片）
-export const Waterfall = memo(function Waterfall({ assets, onOpenAsset, onRemove, showToast, onChanged, onDelete, selMode, selIds, onToggleSel, onAskAI, onSendToAi, onTogglePin }) {
+export const Waterfall = memo(function Waterfall({ assets, onOpenAsset, onRemove, showToast, onChanged, onDelete, selMode, selIds, onToggleSel, onAskAI, onSendToAi, onTogglePin, onRemoveFromCat }) {
   const [pop, setPop] = useState(null); // { assetIds, x, y }
   const [ctx, setCtx] = useState(null); // { x, y, asset } 卡片右键菜单
   const selected = (id) => selMode && selIds?.includes(id);
@@ -185,6 +185,11 @@ export const Waterfall = memo(function Waterfall({ assets, onOpenAsset, onRemove
                 <span>{ctx.asset.pinned_at ? t('取消置顶') : t('置顶到最前')}</span>
               </div>
             )}
+            {onRemoveFromCat && (
+              <div className="ctx-item" onClick={() => { const a = ctx.asset; setCtx(null); onRemoveFromCat(a); }}>
+                <span>{t('移出这个分类')}</span>
+              </div>
+            )}
             <div className="ctx-item" onClick={() => { const a = ctx.asset; setCtx(null); onOpenAsset(a, assets); }}>
               <span>{t('打开详情')}</span>
             </div>
@@ -228,6 +233,15 @@ export default function Library({ refreshKey, active = true, onOpenAsset, showTo
   const togglePin = useCallback(async (a) => {
     const r = await window.refhub.toggleAssetPin(a.id, catId);
     if (r?.ok) { showToast?.(r.pinned ? t('已置顶，在这个分类里排最前') : t('已取消置顶')); setPinBump((b) => b + 1); }
+  }, [catId, showToast]);
+
+  // 把单张图移出当前分类（只解绑，素材还在库里）
+  const removeFromCat = useCallback(async (a) => {
+    await window.refhub.removeAssetFromCategory(a.id, catId);
+    setAssets((prev) => prev.filter((x) => x.id !== a.id));
+    setTotal((n) => Math.max(0, n - 1));
+    window.refhub.listCategories().then(setCats);
+    showToast?.(t('已移出这个分类（素材还在库里）'));
   }, [catId, showToast]);
 
   useEffect(() => {
@@ -312,6 +326,18 @@ export default function Library({ refreshKey, active = true, onOpenAsset, showTo
     setBatchPop({ assetIds: [...selIds], x: r.left - 60, y: r.bottom + 8 });
   };
 
+  // 批量移出当前分类（一个事务解绑，素材都还在库里）
+  const batchRemoveFromCat = async () => {
+    if (!selIds.length || catId == null) return;
+    await window.refhub.removeAssetsFromCategory(selIds, catId);
+    const gone = new Set(selIds);
+    setAssets((prev) => prev.filter((a) => !gone.has(a.id)));
+    setTotal((n) => Math.max(0, n - selIds.length));
+    window.refhub.listCategories().then(setCats);
+    showToast?.(t('已移出 {n} 张（素材还在库里）', { n: selIds.length }));
+    setSelIds([]);
+  };
+
   const [importing, setImporting] = useState(false);
   const importImages = async () => {
     setImporting(true);
@@ -347,6 +373,9 @@ export default function Library({ refreshKey, active = true, onOpenAsset, showTo
             <span className="count">{t('已选 {n}', { n: selIds.length })}</span>
             <button className="ghost" onClick={selectAllVisible}>{t('全选')}</button>
             <button disabled={!selIds.length} onClick={openBatchBoard}>{t('加入图板')}</button>
+            {catId != null && (
+              <button disabled={!selIds.length} onClick={batchRemoveFromCat}>{t('移出分类')}</button>
+            )}
             <button className="danger" disabled={!selIds.length} onClick={batchDelete}>{t('删除')}</button>
             <button className="ghost" onClick={exitSel}>{t('取消')}</button>
           </div>
@@ -412,6 +441,7 @@ export default function Library({ refreshKey, active = true, onOpenAsset, showTo
             onToggleSel={toggleSel}
             onSendToAi={onSendToAi}
             onTogglePin={catId ? togglePin : undefined}
+            onRemoveFromCat={catId ? removeFromCat : undefined}
           />
           {assets.length < total && (
             <div className="load-more">
